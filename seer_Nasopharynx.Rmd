@@ -1,0 +1,604 @@
+---
+title: Analysis of treatment disparities for Nasopharynx cancer patients among the
+  SEER database populations
+author: "Simu Huang, Masanao Yajima"
+date: "2021/11/23"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load("arm", "performance", "see", "randomForest", "dplyr","rstanarm","ggplot2","predtools","magrittr","DescTools","GGally",
+               "gridExtra")
+```
+
+
+
+```{r,include=FALSE, message=FALSE}
+library(readxl)
+trans <- read_excel("D:/R project/seer/Health Literacy Transformed Data.xlsx", 
+                                               sheet = "Nasopharynx")
+```
+
+
+## Abstract
+
+In this project, we study the factors that affect whether patients receives standard treatment defined in the NCCN guidelines for Nasopharynx cancer population in the SEER Database.  We found that factors such as cancer stage, patient's location, household income, age at diagnosis, and whether they have insurance impact whether the patient receives standardized treatment that meets the NCCN guidelines. Patients in stage II, IVA, IVB and IVC, SEER registry in Georgia, have insurance are more likely to receive standard treatment.
+
+\newpage
+## Introduction
+
+Nasopharynx cancer is a type of head and neck cancer and it is the 23rd most common cancer worldwide. It starts in the Nasopharynx, which is located behind the nose and above the back of throat. 
+
+<___________________________> Please add more detailed information. 
+
+For this cancer, We use machine learning methods to study which factors affect whether patients receive standard treatment, especially the patients’ own background, such as income and education. Besides, we try to find the impact of standard treatment and other factors on patient survival situation.
+
+## Data description and cleaning
+
+Our analysis is based on the SEER database sorted out by Anand Devaiah, Pratima Agarwal and Jacob Bloom. We query the data of patients with Nasopharynx cancer. Among four states, we deleted the data for the Alaska region and Connecticut region. Because the variance of the data in these areas are too small. For example, in Alaska region, all the people suffering from Nasopharynx in this area are American Indian/Alaska Native who bought insurance. And none of them received standard treatment. 
+
+Based on the NCCN guideline, the patients with Nasopharynx cancer in stage I are suggested to take radiation and patients in other stages are suggested to take the radiation and chemotherapy. We compare the situation in the SEER database with the NCCN guideline and then transfer the result into a binary variable `receive_standard`. If standard treatment has been given, it is 1; if not, it is 0.
+
+The value `Any medicaid` and `Insured/No specifics`in the `Insurance` column are clustered into the `Insured` and other values are clustered into the `Uninsured`.
+
+The variables we use in the analysis are `Sex`, `std_age`(the difference between age of diagnosis and age 60), `Race`, `Insurance`, `SEER.Registry`, `log(median household income)`(log value of median household income.), `AJCC.7.Stage`, `std_edu`(the proportion of people who in the community with less than a high school education minus the proportion of people who in the state with less than a high school education.), `std_unemployed`(the proportion of people who in the community are unemployed minus the proportion of people who in the state are unemployed.), `std_language_isolation`(the proportion of people who in the community are language isolated minus the proportion of people who in the state are language isolated.), and `receive_standard`. 
+
+
+
+```{r, include=FALSE, message=FALSE}
+# survival situation
+trans$`survival`[which(trans$`Cause of Death`=="Dead (due to other cause)"|trans$`Cause of Death`=="Alive"|trans$`Cause of Death`=="Dead (missing/unknown COD)")] <- 1
+trans$`survival`[which(trans$`Cause of Death`=="Dead (attributable to this cancer dx)")] <- 0
+
+#surgery recommendation
+trans$follow_surgery_reco <- 0
+trans$follow_surgery_reco[which(trans$`Surgery Performed?` == "No" & trans$`Surgery Decision` == "Not recommended" )] <- 1
+trans$follow_surgery_reco[which(trans$`Surgery Performed?` == "Yes" & trans$`Surgery Decision` == "Surgery performed" )] <- 1
+
+#radiation
+trans$radia <- ifelse(trans$Radiation == "No radiation and/or cancer-directed surgery", 0, 1)
+
+# AJCC guideline standard care
+trans$standard_AJCC <- ifelse(trans$`AJCC 7 Stage` == "I", "Radiation", "Chemotherapy and Radiation")
+
+# receive standard therapy or not
+trans$receive_standard <- 0
+trans$receive_standard[which(trans$Radiation == "Radiation after surgery" & trans$Chemotherapy == "Yes" & trans$standard_AJCC == "Chemotherapy and Radiation" )] <- 1
+trans$receive_standard[which(trans$Radiation == "Radiation prior to surgery" & trans$Chemotherapy == "Yes"  & trans$standard_AJCC == "Chemotherapy and Radiation" )] <- 1
+trans$receive_standard[which(trans$Radiation == "Radiation before and after surgery" & trans$Chemotherapy == "Yes"  & trans$standard_AJCC == "Chemotherapy and Radiation" )] <- 1
+trans$receive_standard[which(trans$Radiation == "Radiation after surgery" & trans$Chemotherapy == "No/Unknown" & trans$standard_AJCC == "Radiation" )] <- 1
+trans$receive_standard[which(trans$Radiation == "Radiation prior to surgery" & trans$Chemotherapy == "No/Unknown"  & trans$standard_AJCC == "Radiation" )] <- 1
+trans$receive_standard[which(trans$Radiation == "Radiation before and after surgery" & trans$Chemotherapy == "No/Unknown"  & trans$standard_AJCC == "Radiation" )] <- 1
+trans$Insurance[which(trans$Insurance == "Any Medicaid" | trans$Insurance =="Insured/No specifics")] <- "Insured"
+
+#select the columns
+new_trans <- trans[,c(2,4,5,6,7,8,9,11,13,14,17,18,26,30,12)]
+new_trans <- data.frame(new_trans)
+
+
+#standardized
+
+#median_income
+new_trans$median_income <- log(new_trans$Median.Household.Income)
+
+#unemployment mean value
+ trans_cali <- filter(new_trans,new_trans$SEER.Registry == 'California')
+ mean_cali <- mean(trans_cali$X..Unemployed.ACS.2013.2017)
+ trans_conn <- filter(new_trans,new_trans$SEER.Registry == 'Connecticut')
+ mean_conn <- mean(trans_conn$X..Unemployed.ACS.2013.2017)
+ trans_geor <- filter(new_trans,new_trans$SEER.Registry == 'Georgia')
+ mean_geor <- mean(trans_geor$X..Unemployed.ACS.2013.2017)
+ trans_alas <- filter(new_trans,new_trans$SEER.Registry == 'Alaska')
+ mean_alas <- mean(trans_alas$X..Unemployed.ACS.2013.2017)
+
+
+ for (i in 1:1077) {
+    
+    if (new_trans$SEER.Registry == 'California'){
+      new_trans$stan_unemploy <- new_trans$X..Unemployed.ACS.2013.2017-mean_cali
+    }
+    
+     else if (new_trans$SEER.Registry == 'Georgia'){
+      new_trans$stan_unemploy <- new_trans$X..Unemployed.ACS.2013.2017-mean_geor}
+    
+       else if (new_trans$SEER.Registry == 'Connecticut'){
+      new_trans$stan_unemploy <- new_trans$X..Unemployed.ACS.2013.2017-mean_conn}  
+      
+        else if (new_trans$SEER.Registry == 'Alaska'){
+       new_trans$stan_unemploy <- new_trans$X..Unemployed.ACS.2013.2017-mean_alas 
+    }
+  }
+ 
+# age
+new_trans$stan_age <- new_trans$Age.at.Diagnosis - 60
+new_trans$stan_age <- new_trans$stan_age/10
+
+#education
+trans_cali <- filter(new_trans,new_trans$SEER.Registry == 'California')
+mean_cali <- mean(trans_cali$X...High.School.Education)
+trans_conn <- filter(new_trans,new_trans$SEER.Registry == 'Connecticut')
+mean_conn <- mean(trans_conn$X...High.School.Education)
+trans_geor <- filter(new_trans,new_trans$SEER.Registry == 'Georgia')
+mean_geor <- mean(trans_geor$X...High.School.Education)
+trans_alas <- filter(new_trans,new_trans$SEER.Registry == 'Alaska')
+mean_alas <- mean(trans_alas$X...High.School.Education)
+
+new_trans$stan_edu <- 0
+
+for (i in 1:1077) {
+  
+  if (new_trans$SEER.Registry == 'California'){
+    new_trans$stan_edu <- new_trans$X...9th.Grade.Education-mean_cali
+  }
+  
+   else if (new_trans$SEER.Registry == 'Georgia'){
+    new_trans$stan_edu <- new_trans$X...9th.Grade.Education-mean_geor}
+  
+     else if (new_trans$SEER.Registry == 'Connecticut'){
+    new_trans$stan_edu <- new_trans$X...9th.Grade.Education-mean_conn}  
+    
+      else if (new_trans$SEER.Registry == 'Alaska'){
+    new_trans$stan_edu <- new_trans$X...9th.Grade.Education-mean_alas 
+  }
+}
+
+#language
+trans_cali <- filter(new_trans,new_trans$SEER.Registry == 'California')
+mean_cali <- mean(trans_cali$X..Language.isolation.ACS.2013.2017..households.)
+trans_conn <- filter(new_trans,new_trans$SEER.Registry == 'Connecticut')
+mean_conn <- mean(trans_conn$X..Language.isolation.ACS.2013.2017..households.)
+trans_geor <- filter(new_trans,new_trans$SEER.Registry == 'Georgia')
+mean_geor <- mean(trans_geor$X..Language.isolation.ACS.2013.2017..households.)
+trans_alas <- filter(new_trans,new_trans$SEER.Registry == 'Alaska')
+mean_alas <- mean(trans_alas$X..Language.isolation.ACS.2013.2017..households.)
+
+new_trans$stan_lan <- 0
+
+for (i in 1:1077) {
+  
+  if (new_trans$SEER.Registry == 'California'){
+    new_trans$stan_lan <- new_trans$X..Language.isolation.ACS.2013.2017..households.-mean_cali
+  }
+  
+   else if (new_trans$SEER.Registry == 'Georgia'){
+    new_trans$stan_lan <- new_trans$X..Language.isolation.ACS.2013.2017..households.-mean_geor}
+  
+     else if (new_trans$SEER.Registry == 'Connecticut'){
+    new_trans$stan_lan <- new_trans$X..Language.isolation.ACS.2013.2017..households.-mean_conn}  
+    
+      else if (new_trans$SEER.Registry == 'Alaska'){
+    new_trans$stan_lan <- new_trans$X..Language.isolation.ACS.2013.2017..households.-mean_alas 
+  }
+}
+
+
+
+
+#asfactor
+new_trans$receive_standard <- as.factor(new_trans$receive_standard)
+#delete the Alaska,American Indian/Alaska Native&Connecticut
+new_trans <- new_trans[!(new_trans$SEER.Registry=="Alaska" ),]
+new_trans <- new_trans[!(new_trans$Race=="American Indian/Alaska Native" ),]
+new_trans <- filter(new_trans,new_trans$SEER.Registry != 'Connecticut')
+#baseline
+new_trans$Race <- factor(new_trans$Race, levels = c("White","Hispanic", "Black", "Asian or Pacific Islander", "American Indian/Alaska Native"))
+new_trans$`AJCC.7.Stage` <- factor(new_trans$`AJCC.7.Stage`, levels = c("I", "II","III","IVA","IVB","IVC"))
+new_trans$`SEER.Registry` <- factor(new_trans$`SEER.Registry`, levels = c("California", "Georgia","Connecticut"))
+new_trans$`Sex` <- factor(new_trans$`Sex`, levels = c("Male", "Female"))
+
+
+
+
+```
+
+\newpage
+## EDA
+
+```{r,warning = FALSE, echo=FALSE,fig.width = 8, fig.height=6, message=FALSE}
+# race
+plotdata <- new_trans %>%
+  group_by(Race, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+p1 <- ggplot(plotdata, aes(Race,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = paste(st, "(",lbl,")")), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "Race", 
+       y="Proportion",
+       title  = "Standard Care by Race")+labs(fill='Receive standard treatment or not')+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+
+# race in california
+plotdata <- filter(new_trans, SEER.Registry == 'California') %>%
+  group_by(Race, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+p2 <- ggplot(plotdata, aes(Race,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = paste(st, "(",lbl,")")), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "Race", 
+       y="Proportion",
+       title  = "Standard Care by Race in California")+ labs(fill='Receive standard treatment or not')+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+
+cowplot::plot_grid(
+  p1, NULL, p2, 
+  ncol = 2,
+  rel_widths = c(1, 0.05, 1),
+  byrow = TRUE
+)
+
+```
+
+According to all the data, race has no major influence on receiving standard treatment. But in California, the proportion of blacks receiving standard treatment is significantly lower than that of others. This may  because blacks in California are treated differently from other races. It is also possible that in the other region (George), white people have been treated differently, or relatively few blacks have been diagnosed with the Nasopharynx cancer.
+
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 4.5, fig.height=3}
+
+#seer registry
+plotdata <- new_trans %>%
+  group_by(SEER.Registry, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+ggplot(plotdata, aes(SEER.Registry,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = paste(st, "(",lbl,")")), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "SEER Registry", 
+       y="Proportion",
+       title  = "Standard Care by SEER.Registry")+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+```
+
+There are also differences between regions. Georgia has the highest rate of receiving standard treatment.
+
+```{r, warning = FALSE, echo=FALSE, message=FALSE,fig.width = 6, fig.height=3}
+#stage
+plotdata <- new_trans %>%
+  group_by(AJCC.7.Stage, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+ggplot(plotdata, aes(AJCC.7.Stage,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = paste(st, "(",lbl,")")), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "Stage", 
+       y="Proportion",
+       title  = "Standard Care by AJCC stage")+labs(fill='Receive standard treatment or not')+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+```
+
+From the plot above, AJCC stage is also an important factor. Patients in stage II, III, IVB are more likely to be given standardized treatment.
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 8, fig.height=6}
+#median house income
+p_new_trans <- new_trans
+p_new_trans$receive_standard <- as.numeric(as.character(p_new_trans$receive_standard))
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "0")
+p3 <- ggplot(plotdata,aes(x=median_income,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(),)+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F)+
+   labs(x = "Median household income", 
+       y="Density",
+       title  = "Median household income distribution on patients NOT getting Standard Care")+
+  theme_bw()+theme(legend.position="none")
+
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "1")
+p4 <- ggplot(plotdata,aes(x=median_income,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(),  fill = "#00BFC4", color = "#00BFC4")+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F, color = "#00BFC4")+
+   labs(x = "Median household income", 
+       y="Density",
+       title  = "Median household income distribution on patients getting Standard Care")+
+  theme_bw()+theme(legend.position="none") + xlim(9.75,11.75)+ ylim(0,2)
+
+cowplot::plot_grid(
+  p3, NULL, p4, 
+  ncol = 2,
+  rel_widths = c(1, 0.05, 1),
+  byrow = TRUE
+)
+```
+
+Generally speaking, among people who have received standard treatment, the median household income of the community where the patients live is higher.
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 8, fig.height=6}
+#education
+p_new_trans <- new_trans
+p_new_trans$receive_standard <- as.numeric(as.character(p_new_trans$receive_standard))
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "0")
+p5 <- ggplot(plotdata,aes(x=stan_edu,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge())+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F)+
+   labs(x = "Education", 
+       y="Density",
+       title  = "Education distribution patients NOT getting Standard Care")+
+  theme_bw()+theme(legend.position="none")
+
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "1")
+p6 <- ggplot(plotdata,aes(x=stan_edu,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(), fill = "#00BFC4", color = "#00BFC4")+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F,fill = "#00BFC4", color = "#00BFC4")+
+   labs(x = "Education", 
+       y="Density",
+       title  = "Education distribution on patients getting Standard Care")+
+  theme_bw()+theme(legend.position="none")
+
+cowplot::plot_grid(
+  p5, NULL, p6, 
+  ncol = 2,
+  rel_widths = c(1, 0.05, 1),
+  byrow = TRUE
+)
+```
+
+The level of education and poverty have little effect on whether they are given standard treatment. We can see that the difference between the upper and lower plots is not very big.
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 8, fig.height=6}
+#language isolation
+p_new_trans <- new_trans
+p_new_trans$receive_standard <- as.numeric(as.character(p_new_trans$receive_standard))
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "0")
+p3 <- ggplot(plotdata,aes(x=stan_lan,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(), binwidth = 0.5)+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F)+
+   labs(x = "Language isolation", 
+       y="Density",
+       title  = "Language isolation distribution on patients NOT getting Standard Care")+
+  theme_bw()+theme(legend.position="none")
+
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "1")
+p4 <- ggplot(plotdata,aes(x=stan_lan,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(), binwidth = 0.5, fill = "#00BFC4", color = "#00BFC4")+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F, color = "#00BFC4")+
+   labs(x = "Language isolation", 
+       y="Density",
+       title  = "Language isolation distribution on patients getting Standard Care")+
+  theme_bw()+theme(legend.position="none") 
+
+cowplot::plot_grid(
+  p3, NULL, p4, 
+  ncol = 2,
+  rel_widths = c(1, 0.05, 1),
+  byrow = TRUE
+)
+```
+Language isolation has no significant impact on whether standardized treatment is given.
+
+\newpage
+## Modeling
+
+### Standard therapy 
+
+We use the logistic model here to find that, whether the patient has received standard treatment is related to these independent factors.
+The coefficient plot below displays the point estimates and their confidence intervals. 
+The x-axis represents the coefficient estimate. A positive coefficient indicates that as the value of the independent variable increases, the mean of the dependent variable also tends to increase. A negative coefficient suggests that as the independent variable increases, the dependent variable tends to decrease.
+The y-axis represents different independent variables.
+The line represents the 95% confidence interval, which means that we are 95% confident that the interval captured the true mean value.
+
+```{r, echo = FALSE, warning=FALSE}
+
+set.seed(906)
+#asfactor
+new_trans$Sex <- as.factor(new_trans$Sex) 
+new_trans$`SEER.Registry` <- as.factor(new_trans$`SEER.Registry`)
+new_trans$Insurance <- as.factor(new_trans$Insurance)
+new_trans$Race <- as.factor(new_trans$Race)
+
+#rename
+colnames(new_trans)[which(names(new_trans) == "stan_age")] <- 'std_age'
+colnames(new_trans)[which(names(new_trans) == "stan_edu")] <- 'std_education'
+colnames(new_trans)[which(names(new_trans) == "stan_lan")] <- 'std_language_isolation'
+colnames(new_trans)[which(names(new_trans) == "stan_unemploy")]  <- 'std_unemployed'
+colnames(new_trans)[which(names(new_trans) == "median_income")] <- 'log(median household income)'
+
+#divide the training and testing set
+df  <-  sort(sample(nrow(new_trans), nrow(new_trans)*.7))
+train <- new_trans[df, ]
+test <- new_trans[-df,]
+train_st <- train[,-13] # delete the survival 
+test_st <- test[,-13]   # delete the survival
+train_x <- train[,-c(13,14)]
+train_y <- train[,14]
+test_x <- test[,-c(13,14)]
+test_y <- test[,14]
+
+#modeling
+model_st_x <- glm(receive_standard ~ Sex  + `AJCC.7.Stage` + std_age +  `SEER.Registry` + `log(median household income)` + Insurance + Race+std_education+std_unemployed+std_language_isolation , family = "binomial", data=train) 
+
+#coefficient plot
+ggcoef(model_st_x, exclude_intercept = TRUE) + ylab((""))+ ggtitle("Coefficient Plot of Standard Treatment")
+
+```
+ 
+
+\newpage
+### Survival Situation
+
+We use the logistic model here to find that, the survival situation is related to these independent factors, especially the factor `receive_standard`.
+The coefficient plot below displays the result of the model.
+
+```{r,echo=FALSE, warning=FALSE }
+train_xs <- train[,-13]
+train_ys <- train[,13]
+test_xs <- test[,-13]
+test_ys <- test[,13]
+
+#modeling
+model_sur_x <- glm(survival ~ receive_standard*Race + Sex  + `AJCC.7.Stage`  + std_age +  `SEER.Registry` + `log(median household income)` + Insurance  + std_education + std_unemployed + std_language_isolation, family = "binomial", data=train)
+
+#coefficient plot
+ggcoef(model_sur_x, exclude_intercept = TRUE) + ylab((""))+ ggtitle("Coefficient Plot of Survival Situation")
+```
+
+
+
+\newpage
+## Discussion
+
+### Standard Therapy
+
+Based on the coefficient plot above, we can find that the race, stage of cancer, the area where the patient is located, age at diagnosis, median household income and whether or not have insurance, impact whether the patient receives standard treatment that meets the NCCN guidelines. Compared with whites,  Hispanic is more likely to get standard treatment. When a patient's cancer is in stage II, III, IVB or IVC, they are more probably to receive standard treatment. Uninsured patients will have difficulty getting standardized treatment. Besides, patients in Georgia are more likely to receive standard treatment compared with patients in California. The older the patient, the less likely it is to be given standardized treatment. The education, has negative impact on whether patients receive standard therapy. Unemployed and language isolation situation in the patients community have no impact on patients receive standard treatment or not. 
+
+Meanwhile, compared to patients in other stages, patients in the Stage IVA are less likely to receive standard therapy. We can find that people in this stage are suggested to not only receive radiation but also receive chemotherapy based on the NCCN guideline but most of patients in that stage only receive chemotherapy in our database.  
+
+
+### Survival Situation
+
+Based on the coefficient plot of the survival situation, we can find that cancer stage and whether they have insurance have impact on the patient's survival status. The later the cancer stage is, the more likely it is that they will die of the cancer. After receiving standardized treatment, the survival situation becomes better.
+
+Meanwhile, there is an interaction between whether patients receive standard therapy and race. Compared with white people who receive standard treatment, the survival situation of Hispanic and Asian or Pacific Islander who received standard treatment are worse, and the survival situation of blacks who received standard treatment are better.
+
+
+\newpage
+## Appendix
+
+### Modeling results
+
+### result of standard therapy modeling
+```{r}
+summary(model_st_x)
+```
+### result of survival situation modeling
+```{r}
+summary(model_sur_x)
+```
+
+
+### Model validation
+
+We can find that, in the calibration plot of standard therapy, these red points are evenly distributed around the straight line, which means that this model run very well for the data whose `SEER.Registry` is California. The c-stat score here is 0.676.
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+test_st$receive_standard <- as.numeric(as.character(test_st$receive_standard))
+test_st$pred <- predict(model_st_x, newdata = test_st, type = 'response')
+#calibrarion plot
+calibration_plot(data = test_st, obs = "receive_standard", pred = "pred", y_lim = c(0, 0.7),
+                 title = "Calibration plot for validation data", group = "SEER.Registry")
+#c-statistics
+cat("The c-stat score here is",Cstat(model_st_x))
+```
+
+
+
+### EDA
+
+Following are some other EDA plots related to the factors we selected.
+
+```{r, warning = FALSE, echo=FALSE, message=FALSE}
+# age
+p_new_trans <- new_trans
+p_new_trans$receive_standard <- as.numeric(as.character(p_new_trans$receive_standard))
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "0")
+p3 <- ggplot(plotdata,aes(x=std_age,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(), binwidth = 0.5)+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F)+
+   labs(x = "Language isolation", 
+       y="Density",
+       title  = "Language isolation distribution on patients NOT getting Standard Care")+
+  theme_bw()+theme(legend.position="none")
+
+plotdata <- filter(p_new_trans, p_new_trans$receive_standard == "1")
+p4 <- ggplot(plotdata,aes(x=std_age,fill=as.factor(receive_standard),color=as.factor(receive_standard),group=as.factor(receive_standard)))+
+  geom_histogram(aes(y = ..density..), alpha = 0.4,position = position_dodge(), binwidth = 0.5, fill = "#00BFC4", color = "#00BFC4")+
+   geom_line(aes(y = ..density..,), stat = 'density',show.legend = F, color = "#00BFC4")+
+   labs(x = "Language isolation", 
+       y="Density",
+       title  = "Language isolation distribution on patients getting Standard Care")+
+  theme_bw()+theme(legend.position="none") 
+
+cowplot::plot_grid(
+  p3, NULL, p4, 
+  ncol = 2,
+  rel_widths = c(1, 0.05, 1),
+  byrow = TRUE
+)
+```
+
+
+\newpage
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 4.5, fig.height=3}
+#sex
+plotdata <- new_trans %>%
+  group_by(Sex, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+ggplot(plotdata, aes(Sex,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = lbl), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "Sex", 
+       y="Proportion",
+       title  = "Standard Care by Sex")+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+```
+
+```{r,warning = FALSE, echo=FALSE, message=FALSE,fig.width = 4.5, fig.height=3}
+#Insurance
+plotdata <- new_trans %>%
+  group_by(Insurance, receive_standard) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+plotdata$receive_standard <- as.numeric(as.character(plotdata$receive_standard))
+plotdata$st <- "Yes"
+plotdata$st <- ifelse(plotdata$receive_standard == 0, "No", "Yes")
+
+ggplot(plotdata, aes(Insurance,pct,fill=as.factor(receive_standard)))+
+  geom_bar(stat = "identity",
+           position = "fill") +
+  geom_text(aes(label = lbl), 
+            size = 3, 
+            position = position_stack(vjust = 0.5))+
+  labs(x = "Insurance", 
+       y="Proportion",
+       title  = "Standard Care by Insurance")+
+  theme_bw()+coord_flip()+theme(legend.position="none")
+```
+
+
+
+
